@@ -282,14 +282,18 @@ class TikTokScraper:
         """
         Collect `target` unique video URLs from TikTok's FYP.
 
-        TikTok desktop FYP is a full-screen single-video feed — each Arrow-Down
-        keypress advances exactly one video.  We:
-          1. Grab all links visible right now (pre-loaded batch, usually 3-5)
-          2. Press ArrowDown once  →  TikTok slides to the next video
-          3. Wait for a NEW <a href="/video/..."> to appear in the DOM
-             (proves the next card actually loaded — no fixed sleep guessing)
-          4. Repeat until target reached
-          5. Extra human-like delay every 20 videos + random micro-jitter
+        Root cause of old stalling: TikTok RECYCLES DOM nodes — the number of
+        <a href="/video/..."> elements stays at ~5 even after many scrolls.
+        The old wait_for_function waited for that count to grow, which it never
+        did, so every scroll after the first batch was counted as a stall.
+
+        Fix:
+          - Drop the wait_for_function DOM-count check entirely
+          - Use a fixed delay per scroll (TikTok needs ~2-4s to swap content)
+          - Harvest links from BOTH anchors AND raw page HTML (catches JSON payloads)
+          - Rotate scroll methods (ArrowDown / mouse wheel / JS) to avoid detection
+          - On stall, try recovery: re-focus, scroll up+down, re-navigate
+          - Only give up after 30 consecutive stalls (not 10)
         """
         if not self._page:
             raise RuntimeError("Browser not started — call start() first.")
@@ -304,16 +308,42 @@ class TikTokScraper:
 
         # ── focus the page so keyboard events work ────────────────────────────
         await page.mouse.click(640, 400)
-        await page.wait_for_timeout(1000)
+        await page.wait_for_timeout(1500)
 
         async def harvest() -> int:
-            """Grab every /video/ link in DOM, return count of NEW ones."""
-            hrefs: list[str] = await page.evaluate("""
-                () => Array.from(
-                    document.querySelectorAll('a[href*="/video/"]'),
-                    a => a.href
+            """
+            Grab every /video/ URL from DOM anchors AND raw page HTML.
+            TikTok recycles anchor nodes so the DOM list stays small (~5),
+            but new video URLs are embedded in JSON blobs in the page source.
+            """
+            hrefs: list[str] = []
+
+            # 1. Standard anchor tags + data attributes
+            try:
+                hrefs += await page.evaluate("""
+                    () => {
+                        const urls = [];
+                        document.querySelectorAll('a[href*="/video/"]').forEach(a => urls.push(a.href));
+                        document.querySelectorAll('[data-share-url],[data-url]').forEach(el => {
+                            const u = el.getAttribute('data-share-url') || el.getAttribute('data-url') || '';
+                            if (u.includes('/video/')) urls.push(u);
+                        });
+                        return urls;
+                    }
+                """)
+            except Exception:
+                pass
+
+            # 2. Scan raw HTML for video URLs (finds URLs inside JSON payloads)
+            try:
+                html: str = await page.evaluate(
+                    "() => document.documentElement.innerHTML.slice(0, 500000)"
                 )
-            """)
+                for match in VIDEO_URL_RE.finditer(html):
+                    hrefs.append(match.group(0))
+            except Exception:
+                pass
+
             added = 0
             for href in hrefs:
                 clean = href.split("?")[0].rstrip("/")
@@ -323,52 +353,96 @@ class TikTokScraper:
                     added += 1
             return added
 
-        # Grab whatever is already rendered on first load
+        async def scroll_next():
+            """Rotate between scroll methods to stay human-like."""
+            method = press_count % 3
+            if method == 0:
+                await page.keyboard.press("ArrowDown")
+            elif method == 1:
+                await page.mouse.wheel(0, 800)
+            else:
+                await page.evaluate("window.scrollBy(0, window.innerHeight)")
+
+        async def recover_from_stall():
+            """Unstick a stalled scroll using escalating strategies."""
+            log.info("Stall recovery  stall=%d  links=%d", stall_count, len(links))
+            strategy = (stall_count // 3) % 4
+            if strategy == 0:
+                # Re-click to re-focus, then arrow down
+                await page.mouse.click(640, 400)
+                await page.wait_for_timeout(800)
+                await page.keyboard.press("ArrowDown")
+            elif strategy == 1:
+                # Scroll up to un-stick, then back down twice
+                await page.keyboard.press("ArrowUp")
+                await page.wait_for_timeout(600)
+                await page.keyboard.press("ArrowDown")
+                await page.wait_for_timeout(400)
+                await page.keyboard.press("ArrowDown")
+            elif strategy == 2:
+                # Large JS scroll
+                await page.evaluate("window.scrollBy(0, 2000)")
+                await page.wait_for_timeout(1500)
+            else:
+                # Full re-navigation — most aggressive but most effective
+                log.info("Re-navigating to FYP for recovery (stall=%d)", stall_count)
+                try:
+                    await page.goto(FYP_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
+                    await page.wait_for_timeout(3000)
+                    await page.mouse.click(640, 400)
+                    await page.wait_for_timeout(1000)
+                except Exception as e:
+                    log.warning("Re-navigate failed: %s", e)
+
+        # ── initial harvest ───────────────────────────────────────────────────
         await harvest()
         if progress_cb and links:
             progress_cb(min(len(links), target), target, "initial load")
 
+        # ── main loop ─────────────────────────────────────────────────────────
         while len(links) < target:
 
-            prev_count = len(seen)
-
-            # Press ArrowDown — TikTok advances to next video
-            await page.keyboard.press("ArrowDown")
+            await scroll_next()
             press_count += 1
 
-            # Wait up to 8 s for at least one NEW video link to appear
-            try:
-                await page.wait_for_function(
-                    f"() => document.querySelectorAll('a[href*=\"/video/\"]').length > {prev_count}",
-                    timeout=8000,
-                )
-            except Exception:
-                # No new link appeared — harvest anyway (might be cached)
-                pass
-
-            # Small jitter so behaviour isn't perfectly mechanical
-            await page.wait_for_timeout(random.randint(
-                SCROLL_DELAY_MIN, SCROLL_DELAY_MAX
-            ))
+            # Fixed wait — TikTok needs time to swap in the next video's HTML
+            await page.wait_for_timeout(random.randint(SCROLL_DELAY_MIN, SCROLL_DELAY_MAX))
 
             new = await harvest()
 
             if new == 0:
                 stall_count += 1
-                log.warning("No new links on press %d  stall=%d", press_count, stall_count)
-                if stall_count >= 10:
-                    log.warning("Stalled 10 times — stopping early at %d links", len(links))
+                log.warning("No new links  press=%d  stall=%d  total=%d",
+                            press_count, stall_count, len(links))
+
+                # Extra wait before recovery
+                await page.wait_for_timeout(1200)
+                new = await harvest()
+
+                if new > 0:
+                    stall_count = 0
+                elif stall_count % 3 == 0:
+                    await recover_from_stall()
+                    await page.wait_for_timeout(2000)
+                    new = await harvest()
+                    if new > 0:
+                        stall_count = 0
+
+                if stall_count >= 30:
+                    log.warning("Stalled 30 times in a row — stopping at %d links", len(links))
                     break
             else:
                 stall_count = 0
 
             if progress_cb:
-                progress_cb(min(len(links), target), target,
-                            f"video #{press_count}  +{new} new")
+                progress_cb(
+                    min(len(links), target), target,
+                    f"press #{press_count}  +{new}  stalls={stall_count}"
+                )
 
-            # Every 20 videos take a longer human-like break
-            if press_count % 20 == 0:
-                pause = random.randint(3000, 5000)
+            # Human-like longer pause every 25 scrolls
+            if press_count % 25 == 0:
+                pause = random.randint(2000, 4000)
                 log.info("Long pause  press=%d  collected=%d  pause=%dms",
                          press_count, len(links), pause)
                 await page.wait_for_timeout(pause)
