@@ -402,7 +402,6 @@ async def cmd_start(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         "/cookies — show loaded cookie status\n"
         "/debug — screenshot of what browser sees\n"
         "/help — this message",
-        parse_mode="Markdown",
     )
 
 
@@ -433,7 +432,7 @@ async def cmd_status(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"Last run: {n} links\n"
             f"Use /scrape to start."
         )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await update.message.reply_text(msg)
 
 
 @guard
@@ -444,8 +443,7 @@ async def cmd_cookies(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text(
             f"🍪 *Cookies loaded*\n{state['cookie_info']}\n\n"
             f"Ready to scrape. Run /scrape!",
-            parse_mode="Markdown",
-        )
+            )
     else:
         await update.message.reply_text(
             "❌ *No cookies loaded.*\n\n"
@@ -455,8 +453,7 @@ async def cmd_cookies(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             "2. Install Cookie-Editor extension\n"
             "3. Click it → Export → Export as JSON\n"
             "4. Send that file here",
-            parse_mode="Markdown",
-        )
+            )
 
 
 @guard
@@ -482,7 +479,6 @@ async def cmd_settings(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"Target: `{state['target']}` links\n"
         f"Pause:  `{state['pause']}s` per video\n\n"
         f"Tap to change:",
-        parse_mode="Markdown",
         reply_markup=InlineKeyboardMarkup(kb),
     )
 
@@ -516,7 +512,6 @@ async def cmd_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         f"⏱ Pause: {pause}s per video\n"
         f"⏳ Est. time: ~{int(target * pause / 60) + 2} min\n\n"
         f"I'll update every 10 links. Use /stop to cancel.",
-        parse_mode="Markdown",
     )
 
     loop = asyncio.get_event_loop()
@@ -526,7 +521,6 @@ async def cmd_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.bot.send_message(
                 chat_id=uid,
                 text=f"📊 *{count}/{total}* links collected…",
-                parse_mode="Markdown",
             ),
             loop,
         )
@@ -542,7 +536,6 @@ async def cmd_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                     f"Collected *{len(results)}* links.\n"
                     f"Use /download to get your .txt file."
                 ),
-                parse_mode="Markdown",
             ),
             loop,
         )
@@ -553,7 +546,6 @@ async def cmd_scrape(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             ctx.bot.send_message(
                 chat_id=uid,
                 text=f"❌ *Error:*\n`{err}`",
-                parse_mode="Markdown",
             ),
             loop,
         )
@@ -691,8 +683,7 @@ async def handle_document(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             f"✅ *Cookies loaded!*\n\n"
             f"📋 {info}\n\n"
             f"Run /scrape to start collecting your FYP links.",
-            parse_mode="Markdown",
-        )
+            )
     except (json.JSONDecodeError, ValueError) as e:
         await msg.edit_text(f"❌ Invalid cookie file:\n{e}")
     except Exception as e:
