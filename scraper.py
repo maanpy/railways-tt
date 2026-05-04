@@ -1,35 +1,39 @@
 """
-TikTok FYP Scraper — Playwright-based browser automation.
+TikTok FYP Scraper — core engine.
 
-Two modes:
-  1. scrape_fyp(count)   → scroll the For You page, collect N video links,
-                           extract metadata for each, return clean results.
-  2. scrape_links(urls)  → scrape a user-supplied list of TikTok URLs.
+Flow:
+  1. Accept cookie JSON → filter to essential auth cookies → inject into browser
+  2. Navigate to /foryou  (now logged in as that account)
+  3. Scroll + collect video links until target reached
+  4. Return plain list of URLs
 
-Both return (list[VideoResult], list[FailedURL]).
+Speed target: 200 links in under 20 minutes (well within 25 min limit).
+No metadata scraping — links only, straight from DOM. Fast and clean.
 """
 
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import os
 import random
 import re
-from dataclasses import dataclass, field, asdict
 from typing import Callable, Optional
 
 from playwright.async_api import (
-    async_playwright, Browser, BrowserContext, Page, Response
+    async_playwright, Browser, BrowserContext, Page,
 )
 
 log = logging.getLogger(__name__)
 
-# ── tunables ────────────────────────────────────────────────────────────────────
-CONCURRENCY  = int(os.getenv("SCRAPE_CONCURRENCY", "3"))
-PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT_MS",   "30000"))
-MAX_RETRIES  = int(os.getenv("MAX_RETRIES",       "2"))
+# ── config ────────────────────────────────────────────────────────────────────
 HEADLESS     = os.getenv("HEADLESS", "true").lower() != "false"
+PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT_MS", "30000"))
+
+# Scroll delay range in ms — keeps behaviour human-like, avoids rate limits
+SCROLL_DELAY_MIN = int(os.getenv("SCROLL_DELAY_MIN_MS", "2500"))
+SCROLL_DELAY_MAX = int(os.getenv("SCROLL_DELAY_MAX_MS", "4500"))
 
 FYP_URL = "https://www.tiktok.com/foryou"
 
@@ -38,125 +42,161 @@ USER_AGENTS = [
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/123.0.6312.122 Safari/537.36",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
 ]
 
 VIDEO_URL_RE = re.compile(
-    r'https://(?:www\.)?tiktok\.com/@[\w.]+/video/\d+', re.IGNORECASE
+    r'https?://(?:www\.)?tiktok\.com/@[\w.]+/video/\d+',
+    re.IGNORECASE
 )
-# ── cookie support ───────────────────────────────────────────────────────────────
-# Set TIKTOK_COOKIES env var as a JSON array of cookie objects, e.g.:
-# [{"name":"sessionid","value":"abc123","domain":".tiktok.com","path":"/"}]
-# Export them from your browser using EditThisCookie or Cookie-Editor extension.
 
-import json as _json
+# ── essential TikTok auth cookie names ───────────────────────────────────────
+# TikTok uses many cookies. Only these matter for authentication.
+# Everything else (analytics, tracking, A/B flags) is stripped out.
+ESSENTIAL_COOKIES = {
+    "sessionid",
+    "sessionid_ss",
+    "sid_guard",
+    "sid_tt",
+    "uid_tt",
+    "uid_tt_ss",
+    "sso_uid_tt",
+    "sso_uid_tt_ss",
+    "ttwid",
+    "tt_chain_token",
+    "passport_csrf_token",
+    "passport_csrf_token_default",
+    "msToken",
+    "tt_webid",
+    "tt_webid_v2",
+    "odin_tt",
+    "store-idc",
+    "store-country-code",
+    "store-country-code-src",
+    "s_v_web_id",
+}
 
-def _load_cookies() -> list[dict]:
-    raw = os.getenv("TIKTOK_COOKIES", "").strip()
-    if not raw:
-        return []
+
+def parse_cookies(raw_json: str) -> tuple[list[dict], str]:
+    """
+    Parse raw cookie JSON (from Cookie-Editor, EditThisCookie, Netscape, etc).
+    Returns (filtered_cookies, account_info_string).
+
+    Accepts two formats:
+      A) Array of cookie objects  →  [{name, value, domain, ...}, ...]
+      B) Object keyed by name     →  {"sessionid": "abc", ...}  (rare)
+    """
     try:
-        cookies = _json.loads(raw)
-        # Normalize: ensure required fields, fix sameSite
-        out = []
-        for c in cookies:
-            entry = {
-                "name":   c.get("name", ""),
-                "value":  c.get("value", ""),
-                "domain": c.get("domain", ".tiktok.com"),
-                "path":   c.get("path", "/"),
-            }
-            ss = c.get("sameSite", "None")
-            if ss not in ("Strict", "Lax", "None"):
-                ss = "None"
-            entry["sameSite"] = ss
-            if c.get("httpOnly"):  entry["httpOnly"]  = True
-            if c.get("secure"):    entry["secure"]    = True
-            out.append(entry)
-        log.info("Loaded %d cookies from TIKTOK_COOKIES", len(out))
-        return out
-    except Exception as e:
-        log.warning("Failed to parse TIKTOK_COOKIES: %s", e)
-        return []
+        data = json.loads(raw_json)
+    except json.JSONDecodeError as e:
+        raise ValueError(f"Invalid JSON: {e}")
+
+    cookies_raw: list[dict] = []
+
+    if isinstance(data, list):
+        cookies_raw = data
+    elif isinstance(data, dict):
+        # Convert {name: value} or {name: {value:..., domain:...}} format
+        for k, v in data.items():
+            if isinstance(v, dict):
+                entry = v.copy()
+                entry.setdefault("name", k)
+                cookies_raw.append(entry)
+            else:
+                cookies_raw.append({"name": k, "value": str(v)})
+    else:
+        raise ValueError("Cookie JSON must be an array or object.")
+
+    # ── filter to essential auth cookies only ─────────────────────────────────
+    filtered: list[dict] = []
+    for c in cookies_raw:
+        name = c.get("name", "")
+        if name not in ESSENTIAL_COOKIES:
+            continue
+
+        cookie: dict = {
+            "name":   name,
+            "value":  str(c.get("value", "")),
+            "domain": c.get("domain", ".tiktok.com"),
+            "path":   c.get("path", "/"),
+        }
+
+        # sameSite must be exactly one of these values for Playwright
+        ss = c.get("sameSite", "None")
+        if ss not in ("Strict", "Lax", "None"):
+            ss = "None"
+        cookie["sameSite"] = ss
+
+        if c.get("httpOnly"):
+            cookie["httpOnly"] = True
+        if c.get("secure"):
+            cookie["secure"] = True
+
+        # Expiry — Playwright uses "expires" (float), some exporters use "expirationDate"
+        exp = c.get("expires") or c.get("expirationDate")
+        if exp:
+            try:
+                cookie["expires"] = float(exp)
+            except (TypeError, ValueError):
+                pass
+
+        filtered.append(cookie)
+
+    if not filtered:
+        raise ValueError(
+            "No essential auth cookies found in the file.\n"
+            "Make sure you exported cookies from tiktok.com while logged in.\n"
+            f"Looking for: {', '.join(sorted(ESSENTIAL_COOKIES))}"
+        )
+
+    # Try to extract account hint from uid cookies
+    uid = next(
+        (c["value"][:12] + "…" for c in filtered if c["name"] in ("uid_tt", "uid_tt_ss")),
+        "unknown"
+    )
+    session_present = any(c["name"] == "sessionid" for c in filtered)
+    info = (
+        f"{len(filtered)} auth cookies loaded  |  "
+        f"sessionid: {'✅' if session_present else '❌ MISSING'}  |  "
+        f"uid: {uid}"
+    )
+
+    return filtered, info
 
 
+# ── scraper ───────────────────────────────────────────────────────────────────
 
-
-# ── clean data model ────────────────────────────────────────────────────────────
-@dataclass
-class VideoResult:
-    url:          str
-    video_id:     str       = ""
-    author:       str       = ""        # @username
-    author_name:  str       = ""        # display name
-    verified:     bool      = False
-    description:  str       = ""
-    hashtags:     list[str] = field(default_factory=list)
-    views:        int       = 0
-    likes:        int       = 0
-    comments:     int       = 0
-    shares:       int       = 0
-    saves:        int       = 0
-    duration_sec: int       = 0
-    music_title:  str       = ""
-    music_author: str       = ""
-    cover_url:    str       = ""
-    created_at:   int       = 0         # unix timestamp
-
-    def to_dict(self) -> dict:
-        return asdict(self)
-
-    def to_text(self) -> str:
-        """Clean plain-text card — safe for Telegram without parse_mode."""
-        tags = " ".join(f"#{t}" for t in self.hashtags[:8])
-        dur  = f"{self.duration_sec//60}:{self.duration_sec%60:02d}" if self.duration_sec else "?"
-        vrf  = " ✓" if self.verified else ""
-
-        return "\n".join([
-            f"🎵 @{self.author}{vrf}  {self.author_name}",
-            f"📝 {self.description[:200] or '(no description)'}",
-            f"🏷  {tags or '(no tags)'}",
-            "",
-            f"👁  Views:    {_fmt(self.views)}",
-            f"❤️  Likes:    {_fmt(self.likes)}",
-            f"💬 Comments: {_fmt(self.comments)}",
-            f"🔁 Shares:   {_fmt(self.shares)}",
-            f"🔖 Saves:    {_fmt(self.saves)}",
-            "",
-            f"⏱  Duration: {dur}",
-            f"🎵 Music:    {self.music_title} — {self.music_author}",
-            f"🔗 {self.url}",
-        ])
-
-
-def _fmt(n: int) -> str:
-    if n >= 1_000_000: return f"{n/1_000_000:.1f}M"
-    if n >= 1_000:     return f"{n/1_000:.1f}K"
-    return str(n)
-
-
-# ── scraper class ───────────────────────────────────────────────────────────────
 class TikTokScraper:
 
     def __init__(self):
-        self._pw       = None
+        self._pw      = None
         self._browser: Optional[Browser]       = None
         self._ctx:     Optional[BrowserContext] = None
-        self._fyp_page: Optional[Page]          = None
-        self._alive    = False
+        self._page:    Optional[Page]           = None
+        self._alive   = False
+        self._cookies: list[dict] = []
 
     def is_alive(self) -> bool:
         return self._alive and self._browser is not None
 
-    # ── lifecycle ────────────────────────────────────────────────────────────────
+    def set_cookies(self, cookies: list[dict]):
+        """Store parsed cookies — applied on next start()."""
+        self._cookies = cookies
+
+    # ── lifecycle ─────────────────────────────────────────────────────────────
+
     async def start(self):
-        log.info("Launching browser…")
-        self._pw      = await async_playwright().start()
+        log.info("Launching Chromium…")
+        self._pw = await async_playwright().start()
         self._browser = await self._pw.chromium.launch(
             headless=HEADLESS,
             args=[
-                "--no-sandbox", "--disable-setuid-sandbox",
+                "--no-sandbox",
+                "--disable-setuid-sandbox",
                 "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage", "--disable-gpu",
+                "--disable-dev-shm-usage",
+                "--disable-gpu",
                 "--window-size=1280,800",
             ]
         )
@@ -173,26 +213,43 @@ class TikTokScraper:
                 "Sec-Ch-Ua-Platform": '"Windows"',
             }
         )
-        await self._ctx.add_init_script("""
-            Object.defineProperty(navigator,'webdriver',{get:()=>undefined});
-            window.chrome={runtime:{}};
-            Object.defineProperty(navigator,'languages',{get:()=>['en-US','en']});
-            Object.defineProperty(navigator,'plugins',{get:()=>[1,2,3]});
-        """)
-        # Inject cookies before loading FYP (needed to see personalised feed)
-        cookies = _load_cookies()
-        if cookies:
-            await self._ctx.add_cookies(cookies)
-            log.info("Cookies injected into browser context")
-        else:
-            log.warning("No TIKTOK_COOKIES set — FYP may show generic/empty content")
 
-        self._fyp_page = await self._ctx.new_page()
-        await self._fyp_page.goto(FYP_URL, timeout=PAGE_TIMEOUT,
-                                   wait_until="domcontentloaded")
-        await self._fyp_page.wait_for_timeout(3000)
+        # Anti-detection
+        await self._ctx.add_init_script("""
+            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+            window.chrome = { runtime: {} };
+            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+            Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3, 4, 5] });
+            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+        """)
+
+        # Inject auth cookies BEFORE navigating
+        if self._cookies:
+            await self._ctx.add_cookies(self._cookies)
+            log.info("Injected %d cookies into browser context", len(self._cookies))
+        else:
+            log.warning("No cookies set — browser will be logged out")
+
+        # Block images/media to save bandwidth & speed up scrolling
+        # (we only need the HTML/JS that contains video links)
+        await self._ctx.route(
+            "**/*.{png,jpg,jpeg,gif,webp,mp4,mp3,woff,woff2,ttf,otf}",
+            lambda r: r.abort()
+        )
+
+        self._page = await self._ctx.new_page()
+
+        log.info("Navigating to FYP…")
+        await self._page.goto(
+            FYP_URL,
+            timeout=PAGE_TIMEOUT,
+            wait_until="domcontentloaded"
+        )
+        # Let JS hydrate and login state settle
+        await self._page.wait_for_timeout(4000)
+
         self._alive = True
-        log.info("Browser ready  url=%s", self._fyp_page.url)
+        log.info("Browser ready — URL: %s", self._page.url)
 
     async def stop(self):
         self._alive = False
@@ -202,273 +259,99 @@ class TikTokScraper:
             if self._pw:      await self._pw.stop()
         except Exception:
             pass
-        self._pw = self._browser = self._ctx = self._fyp_page = None
+        self._pw = self._browser = self._ctx = self._page = None
+        log.info("Browser stopped.")
 
-    # ── /debug ───────────────────────────────────────────────────────────────────
+    # ── /debug screenshot ─────────────────────────────────────────────────────
+
     async def debug_screenshot(self) -> tuple[bytes, str, str]:
-        if not self._fyp_page:
+        if not self._page:
             raise RuntimeError("Browser not started.")
-        shot  = await self._fyp_page.screenshot(full_page=False)
-        return shot, self._fyp_page.url, await self._fyp_page.title()
+        shot  = await self._page.screenshot(full_page=False)
+        url   = self._page.url
+        title = await self._page.title()
+        return shot, url, title
 
-    # ── FYP ──────────────────────────────────────────────────────────────────────
-    async def scrape_fyp(
+    # ── FYP link collector ────────────────────────────────────────────────────
+
+    async def collect_fyp_links(
         self,
-        count: int = 20,
+        target: int = 200,
         progress_cb: Optional[Callable[[int, int, str], None]] = None,
-    ) -> tuple[list[VideoResult], list[tuple[str, str]]]:
-        """Scroll FYP, collect `count` unique video links, scrape each."""
-        links = await self._collect_fyp_links(count, progress_cb)
-        log.info("Collected %d links — now scraping metadata…", len(links))
-        return await self._scrape_many(links, progress_cb)
-
-    # ── user-supplied links ──────────────────────────────────────────────────────
-    async def scrape_links(
-        self,
-        urls: list[str],
-        progress_cb: Optional[Callable[[int, int, str], None]] = None,
-    ) -> tuple[list[VideoResult], list[tuple[str, str]]]:
-        return await self._scrape_many(urls, progress_cb)
-
-    # ── FYP link collector ───────────────────────────────────────────────────────
-    async def _collect_fyp_links(
-        self,
-        target: int,
-        progress_cb: Optional[Callable] = None,
     ) -> list[str]:
-        page    = self._fyp_page
-        seen:   set[str]  = set()
-        links:  list[str] = []
-        scrolls = 0
-        max_sc  = target * 5  # safety
+        """
+        Scroll TikTok FYP and collect `target` unique video URLs.
 
-        while len(links) < target and scrolls < max_sc:
-            hrefs: list[str] = await page.evaluate("""
+        Strategy:
+        - Each scroll reveals 3-8 new video cards in the DOM
+        - We wait SCROLL_DELAY_MIN..MAX ms between scrolls (human-like)
+        - Every 15 scrolls we do a longer pause (3-6s) to avoid detection
+        - Safety cap: max 300 scrolls regardless
+        - Returns deduplicated list of canonical video URLs (no query params)
+        """
+        if not self._page:
+            raise RuntimeError("Browser not started — call start() first.")
+
+        seen:  set[str]  = set()
+        links: list[str] = []
+        scroll_count = 0
+        max_scrolls  = 300
+        stall_count  = 0   # consecutive scrolls with no new links
+
+        log.info("Starting FYP collection  target=%d", target)
+
+        while len(links) < target and scroll_count < max_scrolls:
+
+            # ── harvest all video anchors currently rendered in DOM ───────────
+            hrefs: list[str] = await self._page.evaluate("""
                 () => Array.from(
                     document.querySelectorAll('a[href*="/video/"]'),
                     a => a.href
                 )
             """)
+
+            new_this_round = 0
             for href in hrefs:
-                clean = href.split("?")[0]
+                # Strip query params — keep clean canonical URL
+                clean = href.split("?")[0].rstrip("/")
                 if VIDEO_URL_RE.match(clean) and clean not in seen:
                     seen.add(clean)
                     links.append(clean)
+                    new_this_round += 1
 
             if progress_cb:
-                progress_cb(min(len(links), target), target, "collecting…")
+                pct = int(min(len(links), target) / target * 100)
+                progress_cb(min(len(links), target), target,
+                            f"scroll #{scroll_count+1}  +{new_this_round} new")
 
             if len(links) >= target:
                 break
 
-            await page.evaluate("window.scrollBy(0, window.innerHeight * 3)")
-            await page.wait_for_timeout(random.randint(1500, 2500))
-            scrolls += 1
+            # ── stall detection ───────────────────────────────────────────────
+            if new_this_round == 0:
+                stall_count += 1
+                if stall_count >= 8:
+                    log.warning("Stalled for 8 scrolls — possible login wall or end of feed")
+                    break
+            else:
+                stall_count = 0
 
-        return links[:target]
+            # ── scroll down ───────────────────────────────────────────────────
+            await self._page.evaluate(
+                "window.scrollBy(0, window.innerHeight * 2.5)"
+            )
+            scroll_count += 1
 
-    # ── concurrent metadata scraper ──────────────────────────────────────────────
-    async def _scrape_many(
-        self,
-        urls: list[str],
-        progress_cb: Optional[Callable] = None,
-    ) -> tuple[list[VideoResult], list[tuple[str, str]]]:
-        results: list[VideoResult]     = []
-        errors:  list[tuple[str, str]] = []
-        done = 0
-        lock = asyncio.Lock()
-        sem  = asyncio.Semaphore(CONCURRENCY)
+            # Long pause every 15 scrolls (looks more human)
+            if scroll_count % 15 == 0:
+                pause = random.randint(3000, 6000)
+                log.info("Pause at scroll %d  collected=%d  pause=%dms",
+                         scroll_count, len(links), pause)
+                await self._page.wait_for_timeout(pause)
+            else:
+                delay = random.randint(SCROLL_DELAY_MIN, SCROLL_DELAY_MAX)
+                await self._page.wait_for_timeout(delay)
 
-        async def worker(url: str):
-            nonlocal done
-            async with sem:
-                for attempt in range(1, MAX_RETRIES + 2):
-                    try:
-                        v = await self._scrape_one(url)
-                        async with lock:
-                            results.append(v)
-                            done += 1
-                            if progress_cb:
-                                progress_cb(done, len(urls), url)
-                        return
-                    except Exception as exc:
-                        log.warning("attempt %d failed %s: %s", attempt, url, exc)
-                        if attempt <= MAX_RETRIES:
-                            await asyncio.sleep(2 ** attempt)
-                        else:
-                            async with lock:
-                                errors.append((url, str(exc)))
-                                done += 1
-                                if progress_cb:
-                                    progress_cb(done, len(urls), url)
-
-        await asyncio.gather(*[worker(u) for u in urls])
-        return results, errors
-
-    # ── single-URL scraper ───────────────────────────────────────────────────────
-    async def _scrape_one(self, url: str) -> VideoResult:
-        page = await self._ctx.new_page()
-        await page.route(
-            "**/*.{png,jpg,jpeg,gif,webp,woff,woff2,ttf,mp4,mp3}",
-            lambda r: r.abort()
-        )
-        captured: dict = {}
-
-        async def on_resp(resp: Response):
-            try:
-                if resp.status != 200: return
-                u = resp.url
-                if "api/item/detail" in u or "api16-normal" in u:
-                    body = await resp.json()
-                    if isinstance(body, dict) and body.get("itemInfo"):
-                        captured.update(body)
-            except Exception:
-                pass
-
-        page.on("response", lambda r: asyncio.create_task(on_resp(r)))
-
-        try:
-            await page.goto(url, timeout=PAGE_TIMEOUT, wait_until="domcontentloaded")
-            await page.wait_for_timeout(2500)
-
-            if captured:
-                return _parse_api(captured, url)
-
-            raw = await _extract_embedded_json(page)
-            if raw:
-                return _parse_embedded(raw, url)
-
-            return await _parse_dom(page, url)
-        finally:
-            await page.close()
-
-
-# ── JSON parsing helpers ─────────────────────────────────────────────────────────
-
-async def _extract_embedded_json(page: Page) -> dict:
-    for expr in [
-        "()=>{const s=document.getElementById('SIGI_STATE');return s?JSON.parse(s.textContent):null}",
-        "()=>{const s=document.getElementById('__NEXT_DATA__');return s?JSON.parse(s.textContent):null}",
-        """()=>{
-            for(const s of document.querySelectorAll('script[type="application/json"]')){
-                try{const d=JSON.parse(s.textContent);if(d&&(d.ItemModule||d.itemInfo||d.props))return d;}catch(e){}
-            }
-            return null;
-        }""",
-    ]:
-        try:
-            val = await page.evaluate(expr)
-            if val: return val
-        except Exception:
-            pass
-    return {}
-
-
-def _parse_api(raw: dict, url: str) -> VideoResult:
-    item = raw.get("itemInfo", {}).get("itemStruct", {})
-    return _build(item, url)
-
-
-def _parse_embedded(raw: dict, url: str) -> VideoResult:
-    item: dict = {}
-    if "ItemModule" in raw:
-        mods = raw["ItemModule"]
-        if mods:
-            item = next(iter(mods.values()))
-    elif "props" in raw:
-        try:
-            item = (raw["props"]["pageProps"]
-                    .get("itemInfo", {})
-                    .get("itemStruct", {}))
-        except (KeyError, AttributeError):
-            pass
-    elif "itemInfo" in raw:
-        item = raw["itemInfo"].get("itemStruct", {})
-
-    if not item:
-        item = _deep_find(raw, lambda v: isinstance(v,dict) and "desc" in v and "stats" in v) or {}
-
-    return _build(item, url)
-
-
-async def _parse_dom(page: Page, url: str) -> VideoResult:
-    v = VideoResult(url=url)
-    m = re.search(r'tiktok\.com/@([\w.]+)/video/(\d+)', url)
-    if m:
-        v.author   = m.group(1)
-        v.video_id = m.group(2)
-    for prop, attr in [("og:description","description"),("og:title","author_name")]:
-        val: str = await page.evaluate(
-            f'()=>{{const m=document.querySelector(\'meta[property="{prop}"]\');return m?m.content:"";}}')
-        if val: setattr(v, attr, val.strip())
-    v.hashtags = re.findall(r'#(\w+)', v.description)
-    return v
-
-
-def _build(item: dict, url: str) -> VideoResult:
-    if not item:
-        raise ValueError("Empty item — JSON structure not recognised")
-
-    author = item.get("author", {})
-    if not isinstance(author, dict): author = {}
-
-    stats = item.get("stats", {}) or item.get("statsV2", {})
-    video = item.get("video", {})
-    music = item.get("music", {})
-
-    def _i(v):
-        try: return int(v or 0)
-        except: return 0
-
-    tags: list[str] = []
-    for c in item.get("challenges", []):
-        if isinstance(c, dict) and c.get("title"): tags.append(c["title"])
-    for t in item.get("textExtra", []):
-        if isinstance(t, dict) and t.get("hashtagName"): tags.append(t["hashtagName"])
-    if not tags:
-        tags = re.findall(r'#(\w+)', item.get("desc", ""))
-    tags = list(dict.fromkeys(tags))
-
-    uid = author.get("uniqueId") or author.get("uid") or ""
-    if not uid:
-        m = re.search(r'tiktok\.com/@([\w.]+)/', url)
-        if m: uid = m.group(1)
-
-    vid_id = item.get("id") or item.get("itemId") or ""
-    if not vid_id:
-        m = re.search(r'/video/(\d+)', url)
-        if m: vid_id = m.group(1)
-
-    return VideoResult(
-        url          = url,
-        video_id     = str(vid_id),
-        author       = uid,
-        author_name  = author.get("nickname", ""),
-        verified     = bool(author.get("verified", False)),
-        description  = item.get("desc", "").strip(),
-        hashtags     = tags,
-        views        = _i(stats.get("playCount") or stats.get("vvCount")),
-        likes        = _i(stats.get("diggCount")),
-        comments     = _i(stats.get("commentCount")),
-        shares       = _i(stats.get("shareCount")),
-        saves        = _i(stats.get("collectCount")),
-        duration_sec = _i(video.get("duration")),
-        music_title  = music.get("title", ""),
-        music_author = music.get("authorName", ""),
-        cover_url    = video.get("cover") or video.get("dynamicCover", ""),
-        created_at   = _i(item.get("createTime")),
-    )
-
-
-def _deep_find(obj, pred, d=0):
-    if d > 8: return None
-    if pred(obj): return obj
-    if isinstance(obj, dict):
-        for v in obj.values():
-            r = _deep_find(v, pred, d+1)
-            if r: return r
-    elif isinstance(obj, list):
-        for v in obj[:10]:
-            r = _deep_find(v, pred, d+1)
-            if r: return r
-    return None
+        collected = links[:target]
+        log.info("Collection done  links=%d  scrolls=%d", len(collected), scroll_count)
+        return collected

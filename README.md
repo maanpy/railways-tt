@@ -1,175 +1,107 @@
-# 🎵 TikTok FYP Scraper Bot
+# TikTok FYP Scraper Bot
 
-A Telegram-controlled bot that **browses TikTok's For You Page itself**, collects video links automatically, and sends you clean text results with all the stats.
-Built for Railway deployment. Handles 200+ videos per batch.
-
----
-
-## ✨ Features
-
-| Feature | Details |
-|---|---|
-| 🚀 Bulk scraping | 1–200+ TikTok links per batch |
-| ⚡ Concurrent | Configurable parallel pages (default: 3) |
-| 🔄 Auto-retry | Exponential backoff on failures |
-| 📸 /debug | Screenshot of what the browser currently sees |
-| 📦 Clean data | Strips TikTok's bloated JSON to only useful fields |
-| 📁 Auto export | Results sent as `.json` file for large batches |
-| 🔒 Auth | Whitelist-based user ID protection |
-| 📊 Progress bar | Live updates as links are processed |
-| 🐳 Docker | Ready for Railway one-click deploy |
+Telegram bot that logs into TikTok using your cookies, scrolls your For You page, and sends back a plain .txt file of links — one per line.
 
 ---
 
-## 🤖 Bot Commands
+## How it works
 
-| Command | Description |
-|---|---|
-| `/fyp [N]` | 🔥 **Scrape N videos from TikTok For You page** (default 20, max 200) |
-| `/process <links>` | Scrape specific TikTok links you supply |
-| `/debug` | Screenshot of what the browser sees right now |
-| `/status` | Is the browser running? |
-| `/restart` | Restart the browser (fixes CAPTCHAs / stuck sessions) |
-| `/stop` | Stop the browser |
-| `/help` | Show command list |
-
-You can also **paste TikTok links directly** — no command needed, the bot detects them automatically.
+1. You export your TikTok cookies from your browser as JSON
+2. You send that file to the bot
+3. Bot injects the cookies into Chromium (logs in as you)
+4. Bot scrolls /foryou and collects video links
+5. Bot sends you a .txt file — pure links, nothing else
 
 ---
 
-## 📦 Output JSON Structure
+## Setup
 
-Each scraped video produces a clean object:
+### 1. Create a Telegram bot
+- Message @BotFather on Telegram
+- Send /newbot and follow prompts
+- Copy the token it gives you
 
-```json
-{
-  "id": "7234567890123456789",
-  "url": "https://www.tiktok.com/@user/video/...",
-  "created_at": 1716000000,
-  "description": "Check this out! #viral #fyp",
-  "hashtags": ["viral", "fyp"],
+### 2. Get your Telegram user ID
+- Message @userinfobot on Telegram
+- It replies with your numeric ID like 123456789
 
-  "author": {
-    "id": "123456",
-    "username": "cooluser",
-    "nickname": "Cool User",
-    "verified": false,
-    "follower_count": 150000
-  },
+### 3. Deploy to Railway
+- Push this folder to a GitHub repo
+- Go to railway.app → New Project → Deploy from GitHub → select your repo
+- Railway auto-detects the Dockerfile
 
-  "stats": {
-    "views": 5200000,
-    "likes": 430000,
-    "comments": 12000,
-    "shares": 8500,
-    "saves": 22000
-  },
+### 4. Set environment variables (see section below)
 
-  "video": {
-    "duration_sec": 42,
-    "width": 1080,
-    "height": 1920,
-    "cover": "https://...",
-    "download_url": "https://...",
-    "format": "mp4",
-    "ratio": "9:16"
-  },
+### 5. Export TikTok cookies
+- Log into tiktok.com in Chrome or Firefox
+- Install Cookie-Editor extension (free, on Chrome Web Store / Firefox Add-ons)
+- Click the extension → Export → Export as JSON
+- Save the file
 
-  "music": {
-    "id": "789",
-    "title": "original sound",
-    "author": "cooluser",
-    "original": true,
-    "cover": "https://..."
-  },
-
-  "is_ad": false,
-  "duet_enabled": true,
-  "stitch_enabled": true,
-  "comment_enabled": true
-}
-```
+### 6. Use the bot
+- Send /start
+- Upload your cookie .json file
+- Run /fyp
 
 ---
 
-## 🚀 Deploy to Railway
+## Railway Variables — exactly what to add
 
-### Step 1 — Create the Telegram Bot
-1. Open Telegram → search `@BotFather`
-2. `/newbot` → follow prompts → copy the **token**
+Go to Railway → your project → your service → Variables tab → add each one:
 
-### Step 2 — Get your Telegram user ID
-1. Message `@userinfobot` on Telegram → it replies with your ID
-
-### Step 3 — Deploy on Railway
-1. Push this repo to GitHub
-2. Go to [railway.app](https://railway.app) → **New Project** → **Deploy from GitHub**
-3. Select your repo
-4. Railway detects the `Dockerfile` automatically
-
-### Step 4 — Set Environment Variables in Railway
-Go to your project → **Variables** tab → add:
-
-```
-TELEGRAM_BOT_TOKEN=your_token_here
-ALLOWED_USER_IDS=your_telegram_id_here
-SCRAPE_CONCURRENCY=3
-MAX_RETRIES=2
-PAGE_TIMEOUT_MS=30000
-HEADLESS=true
-```
-
-### Step 5 — Deploy
-Click **Deploy** — Railway builds the Docker image and starts the bot.
-Message your bot `/start` to confirm it's working!
-
----
-
-## 🏠 Local Development
-
-```bash
-# Install Python deps
-pip install -r requirements.txt
-
-# Install Playwright browser
-playwright install chromium
-
-# Copy and fill env file
-cp .env.example .env
-# Edit .env with your values
-
-# Run (set HEADLESS=false to see the browser)
-python bot.py
-```
-
----
-
-## ⚙️ Configuration
-
-| Variable | Default | Description |
+| Variable | Value | Notes |
 |---|---|---|
-| `TELEGRAM_BOT_TOKEN` | *(required)* | Your bot token from BotFather |
-| `ALLOWED_USER_IDS` | *(empty = everyone)* | Comma-separated Telegram user IDs |
-| `SCRAPE_CONCURRENCY` | `3` | Parallel browser pages |
-| `PAGE_TIMEOUT_MS` | `30000` | Page load timeout (ms) |
-| `MAX_RETRIES` | `2` | Retries per failed link |
-| `HEADLESS` | `true` | Show browser window (local dev only) |
+| TELEGRAM_BOT_TOKEN | paste your token | from @BotFather — required |
+| ALLOWED_USER_IDS | your numeric ID | from @userinfobot — recommended |
+| MAX_LINKS | 200 | max links per /fyp — optional |
+| SCROLL_DELAY_MIN_MS | 2500 | min ms between scrolls — optional |
+| SCROLL_DELAY_MAX_MS | 4500 | max ms between scrolls — optional |
+| PAGE_TIMEOUT_MS | 30000 | page load timeout ms — optional |
+| HEADLESS | true | always true on Railway — optional |
+
+Railway restarts the bot automatically after you save variables.
 
 ---
 
-## 🔧 Troubleshooting
+## Speed
 
-**Bot not responding?**
-- Check Railway logs for errors
-- Verify `TELEGRAM_BOT_TOKEN` is correct
-- Make sure your user ID is in `ALLOWED_USER_IDS`
+200 links in ~15-20 minutes with default delays.
+The delays are intentional — too fast and TikTok detects the bot.
 
-**Scrape failing / returning no data?**
-- Use `/debug` to see what the browser is actually seeing
-- TikTok may be showing a CAPTCHA — use `/restart` to get a fresh session
-- Try reducing `SCRAPE_CONCURRENCY` to `1` or `2`
+Scroll timing:
+- 2.5 to 4.5 seconds between each scroll
+- Extra 3-6 second pause every 15 scrolls
+- Each scroll yields roughly 4-8 new links
 
-**Bot is slow?**
-- Railway free tier may be slow — upgrade for better CPU
-- Increase `SCRAPE_CONCURRENCY` carefully (>5 risks bans)
-- Large batches (100+) will take several minutes — that's normal
+---
+
+## Commands
+
+| Command | What it does |
+|---|---|
+| /fyp [N] | Scrape N links from your FYP (default 200) |
+| /debug | Screenshot of what the browser currently sees |
+| /status | Browser running? Cookies loaded? |
+| /restart | Restart browser, keep current cookies |
+| /stop | Stop browser (cookies stay loaded) |
+| /clear | Remove cookies and stop browser |
+| /help | Show instructions |
+
+---
+
+## Cookie expiry
+
+TikTok session cookies expire after a few weeks.
+When /fyp stops working or /debug shows a login page, just export fresh cookies and send the new file to the bot.
+
+---
+
+## Output format
+
+fyp_20260504_143022.txt:
+```
+https://www.tiktok.com/@user1/video/7234567890123456789
+https://www.tiktok.com/@user2/video/7234567890123456780
+https://www.tiktok.com/@user3/video/7234567890123456771
+```
+One URL per line. No headers, no stats, no extra text.
