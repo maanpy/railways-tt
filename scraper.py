@@ -1,14 +1,15 @@
 """
-TikTok FYP Scraper — core engine.
+TikTok FYP Scraper
 
-Flow:
-  1. Accept cookie JSON → filter to essential auth cookies → inject into browser
-  2. Navigate to /foryou  (now logged in as that account)
-  3. Scroll + collect video links until target reached
-  4. Return plain list of URLs
+Strategy: intercept TikTok's own recommend API responses.
+When TikTok loads the feed it calls /api/recommend/item_list — each response
+contains a batch of ~10-20 video items with author + video ID.
+We build canonical URLs from those. No DOM scraping, no keyboard tricks.
 
-Speed target: 200 links in under 20 minutes (well within 25 min limit).
-No metadata scraping — links only, straight from DOM. Fast and clean.
+To trigger repeated API calls we use a mix of:
+  - window.scrollTo() to the bottom
+  - Simulating mouse wheel events (what TikTok actually listens to)
+  - Waiting with network idle detection
 """
 
 from __future__ import annotations
@@ -22,18 +23,13 @@ import re
 from typing import Callable, Optional
 
 from playwright.async_api import (
-    async_playwright, Browser, BrowserContext, Page,
+    async_playwright, Browser, BrowserContext, Page, Response,
 )
 
 log = logging.getLogger(__name__)
 
-# ── config ────────────────────────────────────────────────────────────────────
 HEADLESS     = os.getenv("HEADLESS", "true").lower() != "false"
-PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT_MS", "30000"))
-
-# Scroll delay range in ms — keeps behaviour human-like, avoids rate limits
-SCROLL_DELAY_MIN = int(os.getenv("SCROLL_DELAY_MIN_MS", "2500"))
-SCROLL_DELAY_MAX = int(os.getenv("SCROLL_DELAY_MAX_MS", "4500"))
+PAGE_TIMEOUT = int(os.getenv("PAGE_TIMEOUT_MS", "35000"))
 
 FYP_URL = "https://www.tiktok.com/foryou"
 
@@ -42,8 +38,16 @@ USER_AGENTS = [
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/123.0.6312.122 Safari/537.36",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+]
+
+# Every URL pattern TikTok uses for feed/recommend API
+FEED_PATTERNS = [
+    "recommend/item_list",
+    "api/item_list",
+    "aweme/v1/feed",
+    "aweme/v2/feed",
+    "web/api/v2/feed",
+    "api/feed",
 ]
 
 VIDEO_URL_RE = re.compile(
@@ -51,117 +55,64 @@ VIDEO_URL_RE = re.compile(
     re.IGNORECASE
 )
 
-# ── essential TikTok auth cookie names ───────────────────────────────────────
-# TikTok uses many cookies. Only these matter for authentication.
-# Everything else (analytics, tracking, A/B flags) is stripped out.
 ESSENTIAL_COOKIES = {
-    "sessionid",
-    "sessionid_ss",
-    "sid_guard",
-    "sid_tt",
-    "uid_tt",
-    "uid_tt_ss",
-    "sso_uid_tt",
-    "sso_uid_tt_ss",
-    "ttwid",
-    "tt_chain_token",
-    "passport_csrf_token",
-    "passport_csrf_token_default",
-    "msToken",
-    "tt_webid",
-    "tt_webid_v2",
-    "odin_tt",
-    "store-idc",
-    "store-country-code",
-    "store-country-code-src",
-    "s_v_web_id",
+    "sessionid", "sessionid_ss", "sid_guard", "sid_tt",
+    "uid_tt", "uid_tt_ss", "sso_uid_tt", "sso_uid_tt_ss",
+    "ttwid", "tt_chain_token", "passport_csrf_token",
+    "passport_csrf_token_default", "msToken",
+    "tt_webid", "tt_webid_v2", "odin_tt",
+    "store-idc", "store-country-code", "s_v_web_id",
 }
 
 
-def parse_cookies(raw_json: str) -> tuple[list[dict], str]:
-    """
-    Parse raw cookie JSON (from Cookie-Editor, EditThisCookie, Netscape, etc).
-    Returns (filtered_cookies, account_info_string).
+# ── cookie parser ─────────────────────────────────────────────────────────────
 
-    Accepts two formats:
-      A) Array of cookie objects  →  [{name, value, domain, ...}, ...]
-      B) Object keyed by name     →  {"sessionid": "abc", ...}  (rare)
-    """
+def parse_cookies(raw_json: str) -> tuple[list[dict], str]:
     try:
         data = json.loads(raw_json)
     except json.JSONDecodeError as e:
         raise ValueError(f"Invalid JSON: {e}")
 
-    cookies_raw: list[dict] = []
-
+    raw: list[dict] = []
     if isinstance(data, list):
-        cookies_raw = data
+        raw = data
     elif isinstance(data, dict):
-        # Convert {name: value} or {name: {value:..., domain:...}} format
         for k, v in data.items():
-            if isinstance(v, dict):
-                entry = v.copy()
-                entry.setdefault("name", k)
-                cookies_raw.append(entry)
-            else:
-                cookies_raw.append({"name": k, "value": str(v)})
+            entry = v.copy() if isinstance(v, dict) else {"value": str(v)}
+            entry.setdefault("name", k)
+            raw.append(entry)
     else:
         raise ValueError("Cookie JSON must be an array or object.")
 
-    # ── filter to essential auth cookies only ─────────────────────────────────
     filtered: list[dict] = []
-    for c in cookies_raw:
+    for c in raw:
         name = c.get("name", "")
         if name not in ESSENTIAL_COOKIES:
             continue
-
         cookie: dict = {
             "name":   name,
             "value":  str(c.get("value", "")),
             "domain": c.get("domain", ".tiktok.com"),
             "path":   c.get("path", "/"),
+            "sameSite": c.get("sameSite", "None") if c.get("sameSite") in ("Strict","Lax","None") else "None",
         }
-
-        # sameSite must be exactly one of these values for Playwright
-        ss = c.get("sameSite", "None")
-        if ss not in ("Strict", "Lax", "None"):
-            ss = "None"
-        cookie["sameSite"] = ss
-
-        if c.get("httpOnly"):
-            cookie["httpOnly"] = True
-        if c.get("secure"):
-            cookie["secure"] = True
-
-        # Expiry — Playwright uses "expires" (float), some exporters use "expirationDate"
+        if c.get("httpOnly"): cookie["httpOnly"] = True
+        if c.get("secure"):   cookie["secure"]   = True
         exp = c.get("expires") or c.get("expirationDate")
         if exp:
-            try:
-                cookie["expires"] = float(exp)
-            except (TypeError, ValueError):
-                pass
-
+            try: cookie["expires"] = float(exp)
+            except: pass
         filtered.append(cookie)
 
     if not filtered:
         raise ValueError(
-            "No essential auth cookies found in the file.\n"
-            "Make sure you exported cookies from tiktok.com while logged in.\n"
-            f"Looking for: {', '.join(sorted(ESSENTIAL_COOKIES))}"
+            "No essential auth cookies found.\n"
+            "Export cookies from tiktok.com while logged in using Cookie-Editor."
         )
 
-    # Try to extract account hint from uid cookies
-    uid = next(
-        (c["value"][:12] + "…" for c in filtered if c["name"] in ("uid_tt", "uid_tt_ss")),
-        "unknown"
-    )
-    session_present = any(c["name"] == "sessionid" for c in filtered)
-    info = (
-        f"{len(filtered)} auth cookies loaded  |  "
-        f"sessionid: {'✅' if session_present else '❌ MISSING'}  |  "
-        f"uid: {uid}"
-    )
-
+    session_ok = any(c["name"] == "sessionid" for c in filtered)
+    uid = next((c["value"][:12]+"…" for c in filtered if c["name"] in ("uid_tt","uid_tt_ss")), "unknown")
+    info = f"{len(filtered)} cookies  |  sessionid: {'✅' if session_ok else '❌ MISSING'}  |  uid: {uid}"
     return filtered, info
 
 
@@ -181,10 +132,7 @@ class TikTokScraper:
         return self._alive and self._browser is not None
 
     def set_cookies(self, cookies: list[dict]):
-        """Store parsed cookies — applied on next start()."""
         self._cookies = cookies
-
-    # ── lifecycle ─────────────────────────────────────────────────────────────
 
     async def start(self):
         log.info("Launching Chromium…")
@@ -214,42 +162,30 @@ class TikTokScraper:
             }
         )
 
-        # Anti-detection
         await self._ctx.add_init_script("""
-            Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-            window.chrome = { runtime: {} };
-            Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-            Object.defineProperty(navigator, 'plugins',   { get: () => [1, 2, 3, 4, 5] });
-            Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
+            Object.defineProperty(navigator, 'webdriver',           {get: () => undefined});
+            Object.defineProperty(navigator, 'languages',           {get: () => ['en-US','en']});
+            Object.defineProperty(navigator, 'plugins',             {get: () => [1,2,3,4,5]});
+            Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 8});
+            window.chrome = {runtime: {}};
         """)
 
-        # Inject auth cookies BEFORE navigating
+        # Block only actual video/audio streams — NOT images or JS
+        # Images + JS must load or TikTok won't fire API calls
+        await self._ctx.route("**/*.{mp4,m4v,webm,mp3,m4a,ogg,flac}", lambda r: r.abort())
+
         if self._cookies:
             await self._ctx.add_cookies(self._cookies)
-            log.info("Injected %d cookies into browser context", len(self._cookies))
+            log.info("Injected %d cookies", len(self._cookies))
         else:
-            log.warning("No cookies set — browser will be logged out")
-
-        # Block images/media to save bandwidth & speed up scrolling
-        # (we only need the HTML/JS that contains video links)
-        await self._ctx.route(
-            "**/*.{png,jpg,jpeg,gif,webp,mp4,mp3,woff,woff2,ttf,otf}",
-            lambda r: r.abort()
-        )
+            log.warning("No cookies set — will be logged out")
 
         self._page = await self._ctx.new_page()
-
         log.info("Navigating to FYP…")
-        await self._page.goto(
-            FYP_URL,
-            timeout=PAGE_TIMEOUT,
-            wait_until="domcontentloaded"
-        )
-        # Let JS hydrate and login state settle
-        await self._page.wait_for_timeout(4000)
-
+        await self._page.goto(FYP_URL, timeout=PAGE_TIMEOUT, wait_until="networkidle")
+        await self._page.wait_for_timeout(3000)
         self._alive = True
-        log.info("Browser ready — URL: %s", self._page.url)
+        log.info("Browser ready — %s", self._page.url)
 
     async def stop(self):
         self._alive = False
@@ -260,193 +196,201 @@ class TikTokScraper:
         except Exception:
             pass
         self._pw = self._browser = self._ctx = self._page = None
-        log.info("Browser stopped.")
-
-    # ── /debug screenshot ─────────────────────────────────────────────────────
 
     async def debug_screenshot(self) -> tuple[bytes, str, str]:
         if not self._page:
             raise RuntimeError("Browser not started.")
-        shot  = await self._page.screenshot(full_page=False)
-        url   = self._page.url
-        title = await self._page.title()
-        return shot, url, title
+        return (
+            await self._page.screenshot(full_page=False),
+            self._page.url,
+            await self._page.title(),
+        )
 
-    # ── FYP link collector ────────────────────────────────────────────────────
+    # ── main collector ────────────────────────────────────────────────────────
 
     async def collect_fyp_links(
         self,
         target: int = 200,
         progress_cb: Optional[Callable[[int, int, str], None]] = None,
     ) -> list[str]:
-        """
-        Collect `target` unique video URLs from TikTok's FYP.
-
-        Root cause of old stalling: TikTok RECYCLES DOM nodes — the number of
-        <a href="/video/..."> elements stays at ~5 even after many scrolls.
-        The old wait_for_function waited for that count to grow, which it never
-        did, so every scroll after the first batch was counted as a stall.
-
-        Fix:
-          - Drop the wait_for_function DOM-count check entirely
-          - Use a fixed delay per scroll (TikTok needs ~2-4s to swap content)
-          - Harvest links from BOTH anchors AND raw page HTML (catches JSON payloads)
-          - Rotate scroll methods (ArrowDown / mouse wheel / JS) to avoid detection
-          - On stall, try recovery: re-focus, scroll up+down, re-navigate
-          - Only give up after 30 consecutive stalls (not 10)
-        """
         if not self._page:
-            raise RuntimeError("Browser not started — call start() first.")
+            raise RuntimeError("Browser not started.")
 
-        page = self._page
+        page  = self._page
         seen:  set[str]  = set()
         links: list[str] = []
-        stall_count = 0
-        press_count = 0
+        lock  = asyncio.Lock()
 
-        log.info("Starting FYP collection  target=%d", target)
+        def add(url: str) -> bool:
+            clean = url.split("?")[0].rstrip("/")
+            if VIDEO_URL_RE.match(clean) and clean not in seen:
+                seen.add(clean)
+                links.append(clean)
+                return True
+            return False
 
-        # ── focus the page so keyboard events work ────────────────────────────
-        await page.mouse.click(640, 400)
-        await page.wait_for_timeout(1500)
-
-        async def harvest() -> int:
-            """
-            Grab every /video/ URL from DOM anchors AND raw page HTML.
-            TikTok recycles anchor nodes so the DOM list stays small (~5),
-            but new video URLs are embedded in JSON blobs in the page source.
-            """
-            hrefs: list[str] = []
-
-            # 1. Standard anchor tags + data attributes
+        # ── intercept TikTok feed API ─────────────────────────────────────────
+        async def on_response(resp: Response):
             try:
-                hrefs += await page.evaluate("""
+                if resp.status != 200:
+                    return
+                if not any(p in resp.url for p in FEED_PATTERNS):
+                    return
+
+                body = await resp.json()
+                log.info("Feed API hit: %s  status=%s", resp.url[:80], resp.status)
+
+                # TikTok uses different field names across versions
+                items = (
+                    body.get("itemList") or
+                    body.get("aweme_list") or
+                    body.get("items") or
+                    body.get("data") or
+                    []
+                )
+
+                if not isinstance(items, list):
+                    log.debug("Unexpected body structure: %s", list(body.keys()))
+                    return
+
+                added = 0
+                for item in items:
+                    if not isinstance(item, dict):
+                        continue
+
+                    vid_id = (
+                        str(item.get("id") or item.get("aweme_id") or item.get("itemId") or "")
+                    )
+                    author = item.get("author") or item.get("authorInfo") or {}
+                    if isinstance(author, dict):
+                        username = (
+                            author.get("uniqueId") or
+                            author.get("unique_id") or
+                            author.get("uid") or ""
+                        )
+                    else:
+                        username = str(author)
+
+                    if vid_id and username:
+                        url = f"https://www.tiktok.com/@{username}/video/{vid_id}"
+                        async with lock:
+                            if add(url):
+                                added += 1
+
+                if added:
+                    log.info("  → added %d new links (total=%d)", added, len(links))
+
+            except Exception as e:
+                log.debug("Response parse failed: %s", e)
+
+        page.on("response", lambda r: asyncio.create_task(on_response(r)))
+
+        # ── also harvest DOM anchors as fallback ──────────────────────────────
+        async def harvest_dom() -> int:
+            try:
+                hrefs: list[str] = await page.evaluate("""
+                    () => Array.from(
+                        document.querySelectorAll('a[href*="/video/"]'),
+                        a => a.href
+                    )
+                """)
+                added = 0
+                async with lock:
+                    for h in hrefs:
+                        if add(h):
+                            added += 1
+                return added
+            except Exception:
+                return 0
+
+        # ── trigger feed by simulating mouse wheel ────────────────────────────
+        # TikTok listens to wheel events, not scrollTop changes
+        async def trigger_next():
+            try:
+                # Move mouse to center of page first
+                await page.mouse.move(640, 400)
+                # Dispatch a wheel event — this is what the FYP actually responds to
+                await page.evaluate("""
                     () => {
-                        const urls = [];
-                        document.querySelectorAll('a[href*="/video/"]').forEach(a => urls.push(a.href));
-                        document.querySelectorAll('[data-share-url],[data-url]').forEach(el => {
-                            const u = el.getAttribute('data-share-url') || el.getAttribute('data-url') || '';
-                            if (u.includes('/video/')) urls.push(u);
+                        const evt = new WheelEvent('wheel', {
+                            deltaY: 800,
+                            deltaMode: 0,
+                            bubbles: true,
+                            cancelable: true
                         });
-                        return urls;
+                        document.dispatchEvent(evt);
+                        // Also try on the main video container
+                        const container = document.querySelector(
+                            '[class*="DivSwiper"], [class*="swiper"], ' +
+                            '[class*="feed"], [class*="Feed"], ' +
+                            '[class*="main"], main'
+                        );
+                        if (container) container.dispatchEvent(evt.constructor
+                            ? new WheelEvent('wheel', {deltaY:800, deltaMode:0, bubbles:true})
+                            : evt
+                        );
+                        // Fallback scroll
+                        window.scrollBy(0, 800);
                     }
                 """)
-            except Exception:
-                pass
+            except Exception as e:
+                log.debug("trigger_next error: %s", e)
 
-            # 2. Scan raw HTML for video URLs (finds URLs inside JSON payloads)
-            try:
-                html: str = await page.evaluate(
-                    "() => document.documentElement.innerHTML.slice(0, 500000)"
-                )
-                for match in VIDEO_URL_RE.finditer(html):
-                    hrefs.append(match.group(0))
-            except Exception:
-                pass
+        log.info("Starting collection — target=%d", target)
 
-            added = 0
-            for href in hrefs:
-                clean = href.split("?")[0].rstrip("/")
-                if VIDEO_URL_RE.match(clean) and clean not in seen:
-                    seen.add(clean)
-                    links.append(clean)
-                    added += 1
-            return added
-
-        async def scroll_next():
-            """Rotate between scroll methods to stay human-like."""
-            method = press_count % 3
-            if method == 0:
-                await page.keyboard.press("ArrowDown")
-            elif method == 1:
-                await page.mouse.wheel(0, 800)
-            else:
-                await page.evaluate("window.scrollBy(0, window.innerHeight)")
-
-        async def recover_from_stall():
-            """Unstick a stalled scroll using escalating strategies."""
-            log.info("Stall recovery  stall=%d  links=%d", stall_count, len(links))
-            strategy = (stall_count // 3) % 4
-            if strategy == 0:
-                # Re-click to re-focus, then arrow down
-                await page.mouse.click(640, 400)
-                await page.wait_for_timeout(800)
-                await page.keyboard.press("ArrowDown")
-            elif strategy == 1:
-                # Scroll up to un-stick, then back down twice
-                await page.keyboard.press("ArrowUp")
-                await page.wait_for_timeout(600)
-                await page.keyboard.press("ArrowDown")
-                await page.wait_for_timeout(400)
-                await page.keyboard.press("ArrowDown")
-            elif strategy == 2:
-                # Large JS scroll
-                await page.evaluate("window.scrollBy(0, 2000)")
-                await page.wait_for_timeout(1500)
-            else:
-                # Full re-navigation — most aggressive but most effective
-                log.info("Re-navigating to FYP for recovery (stall=%d)", stall_count)
-                try:
-                    await page.goto(FYP_URL, wait_until="domcontentloaded", timeout=PAGE_TIMEOUT)
-                    await page.wait_for_timeout(3000)
-                    await page.mouse.click(640, 400)
-                    await page.wait_for_timeout(1000)
-                except Exception as e:
-                    log.warning("Re-navigate failed: %s", e)
-
-        # ── initial harvest ───────────────────────────────────────────────────
-        await harvest()
-        if progress_cb and links:
+        # Grab initial DOM links (page loaded these on start)
+        await harvest_dom()
+        if progress_cb:
             progress_cb(min(len(links), target), target, "initial load")
 
-        # ── main loop ─────────────────────────────────────────────────────────
+        stall     = 0
+        iteration = 0
+        last_count = len(links)
+
         while len(links) < target:
+            iteration += 1
 
-            await scroll_next()
-            press_count += 1
+            await trigger_next()
 
-            # Fixed wait — TikTok needs time to swap in the next video's HTML
-            await page.wait_for_timeout(random.randint(SCROLL_DELAY_MIN, SCROLL_DELAY_MAX))
+            # Wait 3-5s for API response + render
+            await page.wait_for_timeout(random.randint(3000, 5000))
 
-            new = await harvest()
+            # Also harvest DOM (catches videos TikTok pre-renders)
+            await harvest_dom()
 
-            if new == 0:
-                stall_count += 1
-                log.warning("No new links  press=%d  stall=%d  total=%d",
-                            press_count, stall_count, len(links))
+            current = len(links)
+            gained  = current - last_count
 
-                # Extra wait before recovery
-                await page.wait_for_timeout(1200)
-                new = await harvest()
+            if gained == 0:
+                stall += 1
+                log.warning("Iteration %d — no new links (stall=%d, total=%d)",
+                            iteration, stall, current)
 
-                if new > 0:
-                    stall_count = 0
-                elif stall_count % 3 == 0:
-                    await recover_from_stall()
-                    await page.wait_for_timeout(2000)
-                    new = await harvest()
-                    if new > 0:
-                        stall_count = 0
+                if stall == 4:
+                    # Reload the page and re-inject cookies — sometimes fixes frozen feeds
+                    log.info("Feed frozen — reloading page…")
+                    await page.reload(timeout=PAGE_TIMEOUT, wait_until="networkidle")
+                    await page.wait_for_timeout(4000)
+                    await harvest_dom()
 
-                if stall_count >= 30:
-                    log.warning("Stalled 30 times in a row — stopping at %d links", len(links))
+                if stall >= 8:
+                    log.warning("Stalled 8 iterations — stopping at %d links", current)
                     break
             else:
-                stall_count = 0
+                stall = 0
+                log.info("Iteration %d — +%d new links (total=%d)", iteration, gained, current)
+
+            last_count = len(links)
 
             if progress_cb:
-                progress_cb(
-                    min(len(links), target), target,
-                    f"press #{press_count}  +{new}  stalls={stall_count}"
-                )
+                progress_cb(min(len(links), target), target, f"iter {iteration}")
 
-            # Human-like longer pause every 25 scrolls
-            if press_count % 25 == 0:
-                pause = random.randint(2000, 4000)
-                log.info("Long pause  press=%d  collected=%d  pause=%dms",
-                         press_count, len(links), pause)
+            # Human-like longer break every 30 iterations
+            if iteration % 30 == 0:
+                pause = random.randint(4000, 7000)
+                log.info("Long pause — %dms", pause)
                 await page.wait_for_timeout(pause)
 
-        collected = links[:target]
-        log.info("Collection done  links=%d  presses=%d", len(collected), press_count)
-        return collected
+        result = links[:target]
+        log.info("Collection done — %d links in %d iterations", len(result), iteration)
+        return result
