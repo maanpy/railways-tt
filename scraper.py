@@ -280,78 +280,99 @@ class TikTokScraper:
         progress_cb: Optional[Callable[[int, int, str], None]] = None,
     ) -> list[str]:
         """
-        Scroll TikTok FYP and collect `target` unique video URLs.
+        Collect `target` unique video URLs from TikTok's FYP.
 
-        Strategy:
-        - Each scroll reveals 3-8 new video cards in the DOM
-        - We wait SCROLL_DELAY_MIN..MAX ms between scrolls (human-like)
-        - Every 15 scrolls we do a longer pause (3-6s) to avoid detection
-        - Safety cap: max 300 scrolls regardless
-        - Returns deduplicated list of canonical video URLs (no query params)
+        TikTok desktop FYP is a full-screen single-video feed — each Arrow-Down
+        keypress advances exactly one video.  We:
+          1. Grab all links visible right now (pre-loaded batch, usually 3-5)
+          2. Press ArrowDown once  →  TikTok slides to the next video
+          3. Wait for a NEW <a href="/video/..."> to appear in the DOM
+             (proves the next card actually loaded — no fixed sleep guessing)
+          4. Repeat until target reached
+          5. Extra human-like delay every 20 videos + random micro-jitter
         """
         if not self._page:
             raise RuntimeError("Browser not started — call start() first.")
 
+        page = self._page
         seen:  set[str]  = set()
         links: list[str] = []
-        scroll_count = 0
-        max_scrolls  = 300
-        stall_count  = 0   # consecutive scrolls with no new links
+        stall_count = 0
+        press_count = 0
 
         log.info("Starting FYP collection  target=%d", target)
 
-        while len(links) < target and scroll_count < max_scrolls:
+        # ── focus the page so keyboard events work ────────────────────────────
+        await page.mouse.click(640, 400)
+        await page.wait_for_timeout(1000)
 
-            # ── harvest all video anchors currently rendered in DOM ───────────
-            hrefs: list[str] = await self._page.evaluate("""
+        async def harvest() -> int:
+            """Grab every /video/ link in DOM, return count of NEW ones."""
+            hrefs: list[str] = await page.evaluate("""
                 () => Array.from(
                     document.querySelectorAll('a[href*="/video/"]'),
                     a => a.href
                 )
             """)
-
-            new_this_round = 0
+            added = 0
             for href in hrefs:
-                # Strip query params — keep clean canonical URL
                 clean = href.split("?")[0].rstrip("/")
                 if VIDEO_URL_RE.match(clean) and clean not in seen:
                     seen.add(clean)
                     links.append(clean)
-                    new_this_round += 1
+                    added += 1
+            return added
 
-            if progress_cb:
-                pct = int(min(len(links), target) / target * 100)
-                progress_cb(min(len(links), target), target,
-                            f"scroll #{scroll_count+1}  +{new_this_round} new")
+        # Grab whatever is already rendered on first load
+        await harvest()
+        if progress_cb and links:
+            progress_cb(min(len(links), target), target, "initial load")
 
-            if len(links) >= target:
-                break
+        while len(links) < target:
 
-            # ── stall detection ───────────────────────────────────────────────
-            if new_this_round == 0:
+            prev_count = len(seen)
+
+            # Press ArrowDown — TikTok advances to next video
+            await page.keyboard.press("ArrowDown")
+            press_count += 1
+
+            # Wait up to 8 s for at least one NEW video link to appear
+            try:
+                await page.wait_for_function(
+                    f"() => document.querySelectorAll('a[href*=\"/video/\"]').length > {prev_count}",
+                    timeout=8000,
+                )
+            except Exception:
+                # No new link appeared — harvest anyway (might be cached)
+                pass
+
+            # Small jitter so behaviour isn't perfectly mechanical
+            await page.wait_for_timeout(random.randint(
+                SCROLL_DELAY_MIN, SCROLL_DELAY_MAX
+            ))
+
+            new = await harvest()
+
+            if new == 0:
                 stall_count += 1
-                if stall_count >= 8:
-                    log.warning("Stalled for 8 scrolls — possible login wall or end of feed")
+                log.warning("No new links on press %d  stall=%d", press_count, stall_count)
+                if stall_count >= 10:
+                    log.warning("Stalled 10 times — stopping early at %d links", len(links))
                     break
             else:
                 stall_count = 0
 
-            # ── scroll down ───────────────────────────────────────────────────
-            await self._page.evaluate(
-                "window.scrollBy(0, window.innerHeight * 2.5)"
-            )
-            scroll_count += 1
+            if progress_cb:
+                progress_cb(min(len(links), target), target,
+                            f"video #{press_count}  +{new} new")
 
-            # Long pause every 15 scrolls (looks more human)
-            if scroll_count % 15 == 0:
-                pause = random.randint(3000, 6000)
-                log.info("Pause at scroll %d  collected=%d  pause=%dms",
-                         scroll_count, len(links), pause)
-                await self._page.wait_for_timeout(pause)
-            else:
-                delay = random.randint(SCROLL_DELAY_MIN, SCROLL_DELAY_MAX)
-                await self._page.wait_for_timeout(delay)
+            # Every 20 videos take a longer human-like break
+            if press_count % 20 == 0:
+                pause = random.randint(3000, 5000)
+                log.info("Long pause  press=%d  collected=%d  pause=%dms",
+                         press_count, len(links), pause)
+                await page.wait_for_timeout(pause)
 
         collected = links[:target]
-        log.info("Collection done  links=%d  scrolls=%d", len(collected), scroll_count)
+        log.info("Collection done  links=%d  presses=%d", len(collected), press_count)
         return collected
