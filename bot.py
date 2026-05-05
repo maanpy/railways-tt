@@ -8,6 +8,7 @@ import re
 import csv
 import json
 import time
+import random
 import asyncio
 import logging
 import threading
@@ -153,13 +154,19 @@ def run_scraper(user_id: int, target: int, pause: float,
                     "--disable-blink-features=AutomationControlled",
                 ]
             )
+            # ── Use mobile viewport + UA so TikTok renders a normal
+            #    infinite-scroll feed instead of the desktop swiper.
+            #    The desktop /foryou swiper only pre-loads ~9 cards and
+            #    ArrowDown stops firing new API calls after that.
             context = browser.new_context(
                 user_agent=(
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0.0.0 Safari/537.36"
+                    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+                    "AppleWebKit/605.1.15 (KHTML, like Gecko) "
+                    "Version/17.0 Mobile/15E148 Safari/604.1"
                 ),
-                viewport={"width": 1280, "height": 900},
+                viewport={"width": 390, "height": 844},
+                is_mobile=True,
+                has_touch=True,
                 java_script_enabled=True,
                 locale="en-US",
                 timezone_id="America/New_York",
@@ -218,15 +225,16 @@ def run_scraper(user_id: int, target: int, pause: float,
                 context.add_cookies(cookies)
                 logger.info("Injected %d cookies", len(cookies))
 
-            logger.info("Loading TikTok FYP…")
+            logger.info("Loading TikTok FYP (mobile)…")
+            # Mobile URL gives a normal infinite-scroll feed — reliable with scrollBy
             page.goto(
-                "https://www.tiktok.com/foryou",
+                "https://www.tiktok.com/",
                 wait_until="domcontentloaded",
                 timeout=45_000,
             )
-            time.sleep(10)   # let JS fully hydrate + API calls fire
+            time.sleep(8)
 
-            # Dismiss any cookie/age popups
+            # Dismiss popups
             for sel in [
                 "button:has-text('Accept all')",
                 "button:has-text('I am 18+')",
@@ -234,142 +242,134 @@ def run_scraper(user_id: int, target: int, pause: float,
                 "[data-e2e='modal-close-inner-button']",
             ]:
                 try:
-                    page.click(sel, timeout=2000)
+                    page.click(sel, timeout=1500)
                     time.sleep(0.5)
                 except Exception:
                     pass
 
-            # Wait for video cards to appear
+            # Wait for first video links to appear
             try:
-                page.wait_for_selector(
-                    "[class*='DivItemContainer'], [class*='video-feed'], a[href*='/video/']",
-                    timeout=15_000,
-                )
-                time.sleep(3)
+                page.wait_for_selector("a[href*='/video/']", timeout=15_000)
+                time.sleep(2)
             except Exception:
-                logger.warning("Video container selector not found — continuing anyway")
-
-            # Give page focus for keyboard events
-            page.mouse.click(640, 450)
-            time.sleep(1)
+                logger.warning("No video links found on initial load")
 
             scroll_count = 0
             last_count   = 0
             stuck_count  = 0
-            max_scrolls  = target * 6
+            last_scroll_y = 0
 
-            while len(collected) < target and scroll_count < max_scrolls:
-                if stop_event.is_set():
-                    break
+            def harvest():
+                """Collect all video links currently in DOM + from intercepted API."""
+                added = 0
 
-                # ── Method 1: API intercepted URLs ────────────────────────────
+                # From API interceptor
                 pending_ids = []
-                for url in list(api_urls):
-                    if url.startswith("__ID__"):
-                        pending_ids.append(url[6:])
+                for u in list(api_urls):
+                    if u.startswith("__ID__"):
+                        pending_ids.append(u[6:])
                         continue
-                    clean = url.split("?")[0]
+                    clean = u.split("?")[0]
                     if TIKTOK_VIDEO_RE.match(clean) and clean not in seen:
-                        seen.add(clean)
-                        collected.append(clean)
-                        if len(collected) % 10 == 0 or len(collected) == target:
-                            on_progress(len(collected), target)
+                        seen.add(clean); collected.append(clean); added += 1
                 api_urls.clear()
 
-                # Resolve bare IDs by searching page HTML
+                # Resolve bare video IDs via HTML
                 if pending_ids:
                     html = page.content()
                     for vid_id in pending_ids:
                         m = re.search(
-                            r'https://www\.tiktok\.com/@([\w\.]+)/video/' + vid_id,
-                            html
+                            r'https://www\.tiktok\.com/@([\w\.]+)/video/' + vid_id, html
                         )
-                        clean = (
+                        url = (
                             f"https://www.tiktok.com/@{m.group(1)}/video/{vid_id}"
-                            if m else
-                            f"https://www.tiktok.com/video/{vid_id}"
+                            if m else f"https://www.tiktok.com/video/{vid_id}"
                         )
-                        if clean not in seen:
-                            seen.add(clean)
-                            collected.append(clean)
-                            if len(collected) % 10 == 0 or len(collected) == target:
-                                on_progress(len(collected), target)
+                        if url not in seen:
+                            seen.add(url); collected.append(url); added += 1
 
-                # ── Method 2: Full page HTML scan ─────────────────────────────
-                html = page.content()
-                for url in TIKTOK_VIDEO_RE.findall(html):
-                    clean = url.split("?")[0]
-                    if clean not in seen:
-                        seen.add(clean)
-                        collected.append(clean)
-                        if len(collected) % 10 == 0 or len(collected) == target:
-                            on_progress(len(collected), target)
-                    if len(collected) >= target:
-                        break
+                # From DOM anchors
+                try:
+                    hrefs = page.eval_on_selector_all(
+                        "a[href*='/video/']", "els => els.map(e => e.href)"
+                    )
+                    for href in hrefs:
+                        clean = href.split("?")[0]
+                        if TIKTOK_VIDEO_RE.match(clean) and clean not in seen:
+                            seen.add(clean); collected.append(clean); added += 1
+                except Exception:
+                    pass
 
-                # ── Method 3: Anchor tags ──────────────────────────────────────
-                if len(collected) < target:
-                    try:
-                        hrefs = page.eval_on_selector_all(
-                            "a[href*='/video/']",
-                            "els => els.map(e => e.href)"
-                        )
-                        for url in hrefs:
-                            clean = url.split("?")[0]
-                            if TIKTOK_VIDEO_RE.match(clean) and clean not in seen:
-                                seen.add(clean)
-                                collected.append(clean)
-                                if len(collected) % 10 == 0 or len(collected) == target:
-                                    on_progress(len(collected), target)
-                            if len(collected) >= target:
-                                break
-                    except Exception:
-                        pass
+                return added
+
+            # Initial harvest
+            harvest()
+            if collected:
+                on_progress(len(collected), target)
+
+            while len(collected) < target:
+                if stop_event.is_set():
+                    break
+
+                # Scroll down by 2 full screen heights
+                page.evaluate("window.scrollBy({top: window.innerHeight * 2, behavior: 'smooth'})")
+                time.sleep(pause)
+
+                # Extra wait if page hasn't moved (lazy-load trigger)
+                new_y = page.evaluate("window.scrollY")
+                if new_y == last_scroll_y:
+                    # Page didn't scroll — try a hard scroll
+                    page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    time.sleep(2)
+                last_scroll_y = page.evaluate("window.scrollY")
+
+                added = harvest()
 
                 if len(collected) >= target:
                     break
 
-                # ── Stuck detection ────────────────────────────────────────────
+                # Progress update every 5 new links
+                prev_reported = ((len(collected) - added) // 5) * 5
+                curr_reported = (len(collected) // 5) * 5
+                if curr_reported > prev_reported or len(collected) == target:
+                    on_progress(min(len(collected), target), target)
+
+                # Stuck detection
                 if len(collected) == last_count:
                     stuck_count += 1
-                    logger.warning("Stuck at %d — attempt %d", len(collected), stuck_count)
+                    logger.warning("No new links — scroll %d stuck=%d total=%d",
+                                   scroll_count, stuck_count, len(collected))
+                    if stuck_count == 5:
+                        # Try scrolling back up a bit then down — can unstick lazy load
+                        page.evaluate("window.scrollBy({top: -400, behavior: 'smooth'})")
+                        time.sleep(1)
+                        page.evaluate("window.scrollBy({top: 800, behavior: 'smooth'})")
+                        time.sleep(2)
+                    if stuck_count == 10:
+                        # Try navigating to /foryou as fallback
+                        logger.info("Trying /foryou fallback…")
+                        page.goto("https://www.tiktok.com/foryou",
+                                  wait_until="domcontentloaded", timeout=20_000)
+                        time.sleep(5)
+                        stuck_count = 0
+                    if stuck_count >= 20:
+                        logger.warning("Stuck for 20 attempts — stopping at %d", len(collected))
+                        break
                 else:
                     stuck_count = 0
+
                 last_count = len(collected)
-
-                # ── Navigate to next video ─────────────────────────────────────
-                try:
-                    page.keyboard.press("ArrowDown")
-                except Exception:
-                    page.evaluate("window.scrollBy(0, window.innerHeight)")
-
-                # Every 10 navigations also do a JS scroll for safety
-                if scroll_count % 10 == 0:
-                    page.evaluate("window.scrollBy(0, window.innerHeight)")
-                    time.sleep(1)
-
-                # If stuck for 15 attempts, try the on-screen next button
-                if stuck_count == 15:
-                    try:
-                        page.click(
-                            "[data-e2e='arrow-down'], [class*='ButtonDown'], .swiper-button-next",
-                            timeout=2000,
-                        )
-                        time.sleep(2)
-                    except Exception:
-                        pass
-
-                if stuck_count >= 30:
-                    logger.warning("Stuck for 30 consecutive attempts — stopping early")
-                    break
-
-                time.sleep(max(pause, 3.0))
                 scroll_count += 1
+
+                # Human-like longer pause every 30 scrolls
+                if scroll_count % 30 == 0:
+                    logger.info("Long pause at scroll %d…", scroll_count)
+                    time.sleep(random.uniform(4, 7))
 
             if not collected:
                 try:
                     page.screenshot(path="/tmp/debug.png", full_page=False)
-                    logger.warning("0 results — debug screenshot saved to /tmp/debug.png")
+                    logger.warning("0 results — debug screenshot saved")
                 except Exception:
                     pass
 
